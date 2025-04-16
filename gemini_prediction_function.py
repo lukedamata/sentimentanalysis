@@ -7,9 +7,10 @@ This file provides two main functions for predicting stock returns based on Redd
     2. predict_returns(model, sentiment_data_today, stock_universe_today): Generates predictions.
 
 Feature Engineering: Includes sentiment statistics, volume indicators, temporal patterns,
-probability measures, and source/topic/relevance weights.
+probability measures (incl. difference), source/topic/relevance weights, and interaction features.
 
-Model: A feedforward neural network implemented in PyTorch with GPU support.
+Model: A feedforward neural network with Batch Normalization, implemented in PyTorch with GPU support.
+Target Clipping: Clips extreme return values during training.
 """
 
 import pandas as pd
@@ -17,17 +18,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import skew
 from datetime import time, timedelta
 import warnings
 
-# Suppress potential warnings from pandas operations like fillna
+# Suppress potential warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 
 
-# Set device for GPU usage if available, otherwise use CPU.
+# Set device for GPU usage if available
 try:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -43,308 +45,165 @@ except Exception as e:
 ####################################
 
 def convert_return(x):
-    """
-    Converts a return value (string percentage or number) to a float.
-
-    Parameters:
-    -----------
-    x : str or float or int
-        The return value to convert.
-
-    Returns:
-    --------
-    float
-        The return value as a float. Returns NaN if conversion fails.
-    """
+    """Converts a return value to a float."""
     if isinstance(x, str):
         x = x.strip()
         if x.endswith('%'):
             try:
                 return float(x[:-1].strip()) / 100.0
-            except ValueError:
-                return np.nan
+            except ValueError: return np.nan
         else:
-            try:
-                return float(x)
-            except ValueError:
-                return np.nan
+            try: return float(x)
+            except ValueError: return np.nan
     elif isinstance(x, (int, float)):
         return float(x)
     else:
-        return np.nan # Handle unexpected types
+        return np.nan
 
 def preprocess_sentiment_data(sentiment_data):
-    """
-    Preprocesses raw sentiment data.
-
-    Steps:
-    1.  Converts 'Received_Time' to timezone-aware datetime (UTC), then to US/Eastern.
-    2.  Creates a 'Date' column for merging with returns: posts after 4:00 PM EST
-        are assigned to the *next* trading day's date.
-    3.  Ensures 'Ticker' is uppercase.
-    4.  Handles potential missing columns needed for feature engineering by adding them with default values.
-
-    Parameters:
-    -----------
-    sentiment_data : pd.DataFrame
-        Raw sentiment data. Must contain 'Received_Time' and 'Ticker'.
-
-    Returns:
-    --------
-    pd.DataFrame
-        Processed sentiment data with 'Received_Time_EST' and 'Date' columns added,
-        and necessary columns ensured.
-    """
+    """Preprocesses raw sentiment data."""
     if not isinstance(sentiment_data, pd.DataFrame):
         raise TypeError("sentiment_data must be a pandas DataFrame.")
-
     df = sentiment_data.copy()
-
-    # --- Time Conversion ---
-    if 'Received_Time' not in df.columns:
-        raise ValueError("Column 'Received_Time' not found in the sentiment data.")
-    # Ensure Received_Time is parsed correctly, handling potential errors
+    if 'Received_Time' not in df.columns: raise ValueError("'Received_Time' not found.")
     try:
         df['Received_Time'] = pd.to_datetime(df['Received_Time'], errors='coerce', utc=True)
-        df = df.dropna(subset=['Received_Time']) # Drop rows where conversion failed
-    except Exception as e:
-        raise ValueError(f"Error converting 'Received_Time' to datetime: {e}")
-
+        df = df.dropna(subset=['Received_Time'])
+    except Exception as e: raise ValueError(f"Error converting 'Received_Time': {e}")
     if df.empty:
-        print("Warning: No valid 'Received_Time' entries found after conversion.")
-        # Return an empty DataFrame with expected columns for downstream processing
+        print("Warning: No valid 'Received_Time' entries.")
         df['Received_Time_EST'] = pd.Series(dtype='datetime64[ns, America/New_York]')
         df['Date'] = pd.Series(dtype='datetime64[ns]')
         df['Ticker'] = pd.Series(dtype='object')
         return df
-
     df['Received_Time_EST'] = df['Received_Time'].dt.tz_convert('America/New_York')
-    df['local_date'] = df['Received_Time_EST'].dt.date # Keep local date for reference if needed
-
-    # --- Date Assignment for Trading ---
-    # Posts after 4 PM EST market close are considered for the next day's return prediction
+    df['local_date'] = df['Received_Time_EST'].dt.date
     cutoff_time = time(16, 0)
     df['Date'] = df['Received_Time_EST'].apply(
         lambda dt: pd.to_datetime(dt.date() + timedelta(days=1)) if dt.time() > cutoff_time else pd.to_datetime(dt.date())
-    )
-    df['Date'] = df['Date'].dt.normalize() # Ensure date is midnight
-
-    # --- Ticker Normalization ---
+    ).dt.normalize()
     if 'Ticker' in df.columns:
         df['Ticker'] = df['Ticker'].astype(str).str.upper().str.strip()
-    else:
-        raise ValueError("Column 'Ticker' not found in the sentiment data.")
-
-    # --- Ensure Necessary Columns Exist ---
-    # Add columns needed for feature engineering if they are missing, filling with appropriate defaults
+    else: raise ValueError("'Ticker' not found.")
     required_cols = {
         'Sentiment': 0, 'Confidence': 0.0, 'Prob_POS': 0.0, 'Prob_NTR': 0.0, 'Prob_NEG': 0.0,
         'Relevance': 0.0, 'SourceWeight': 0.0, 'TopicWeight': 0.0, 'Author': 'missing_author',
-        'Novelty': 1, 'StoryID': 'missing_storyid' # Use StoryID for post count if Sentiment is missing
+        'Novelty': 1, 'StoryID': 'missing_storyid'
     }
-    for col, default_value in required_cols.items():
+    for col, default in required_cols.items():
         if col not in df.columns:
-            print(f"Warning: Column '{col}' not found. Adding with default value: {default_value}.")
-            df[col] = default_value
-
-    # Convert relevant columns to numeric, coercing errors
+            print(f"Warning: Column '{col}' not found. Adding default.")
+            df[col] = default
     numeric_cols = ['Sentiment', 'Confidence', 'Prob_POS', 'Prob_NTR', 'Prob_NEG',
                     'Relevance', 'SourceWeight', 'TopicWeight', 'Novelty']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    # Fill NaNs created by coercion in numeric cols (except Sentiment which might be intentionally missing)
-    for col in numeric_cols:
-         if col != 'Sentiment':
-              df[col].fillna(0, inplace=True)
-
-    # Ensure Author is string
-    if 'Author' in df.columns:
-        df['Author'] = df['Author'].astype(str)
-
+            if col != 'Sentiment': df[col].fillna(0, inplace=True)
+    if 'Author' in df.columns: df['Author'] = df['Author'].astype(str)
     return df
-
 
 def create_features(df_processed):
     """
-    Creates aggregated daily features for each Ticker based on preprocessed sentiment data.
-
-    Features include:
-    - Sentiment Stats: mean, std, skew, positive/negative ratio.
-    - Volume Indicators: post count (log-transformed), unique author count.
-    - Temporal Patterns: Sentiment difference AM vs PM, Volume ratio AM vs PM.
-    - Probability Measures: Averages of Prob_POS/NTR/NEG, avg confidence, avg uncertainty.
-    - Weights/Relevance: Averages of SourceWeight, TopicWeight, Relevance. Weighted sentiment.
-    - Other: Average Novelty.
-
-    Parameters:
-    -----------
-    df_processed : pd.DataFrame
-        Preprocessed sentiment data from `preprocess_sentiment_data`.
-        Must include 'Ticker', 'Date', 'Received_Time_EST', and various sentiment/meta columns.
-
-    Returns:
-    --------
-    pd.DataFrame
-        DataFrame with aggregated features, indexed by ['Ticker', 'Date'].
-        Returns an empty DataFrame if input is empty.
+    Creates aggregated daily features for each Ticker. Includes prob_diff feature.
     """
     if df_processed.empty:
         print("Warning: Input DataFrame to create_features is empty.")
-        # Define expected columns for an empty output DataFrame
-        feature_names = [
+        feature_names = [ # Define expected columns for empty output
             'sentiment_mean', 'sentiment_std', 'sentiment_skew', 'pos_neg_ratio',
             'log_post_count', 'author_count', 'sentiment_am_pm_diff', 'volume_am_pm_ratio',
-            'avg_confidence', 'avg_prob_pos', 'avg_prob_ntr', 'avg_prob_neg',
+            'avg_confidence', 'avg_prob_pos', 'avg_prob_ntr', 'avg_prob_neg', 'prob_diff', # Added prob_diff
             'prob_uncertainty', 'avg_source_weight', 'avg_topic_weight',
-            'weighted_sentiment_relevance', 'avg_relevance', 'avg_novelty'
+            'weighted_sentiment_relevance', 'avg_relevance', 'avg_novelty',
+            'sentiment_volume_interaction'
         ]
         return pd.DataFrame(columns=['Ticker', 'Date'] + feature_names)
 
-    # --- Feature Engineering Calculations ---
-
-    # Define aggregation functions
+    # Aggregation
     agg_funcs = {
-        'Sentiment': ['mean', 'std', lambda x: skew(x.dropna())], # Use lambda for skew
-        'Confidence': 'mean',
-        'Prob_POS': 'mean',
-        'Prob_NTR': 'mean',
-        'Prob_NEG': 'mean',
-        'Relevance': 'mean',
-        'SourceWeight': 'mean',
-        'TopicWeight': 'mean',
-        'Novelty': 'mean',
-        'Author': pd.Series.nunique, # Count unique authors
-        'StoryID': 'count' # Use StoryID count as a robust post count measure
+        'Sentiment': ['mean', 'std', lambda x: skew(x.dropna())], 'Confidence': 'mean',
+        'Prob_POS': 'mean', 'Prob_NTR': 'mean', 'Prob_NEG': 'mean', 'Relevance': 'mean',
+        'SourceWeight': 'mean', 'TopicWeight': 'mean', 'Novelty': 'mean',
+        'Author': pd.Series.nunique, 'StoryID': 'count'
     }
-
-    # Perform initial aggregation
     grouped = df_processed.groupby(['Ticker', 'Date']).agg(agg_funcs)
-
-    # Rename columns for clarity
     grouped.columns = [
         'sentiment_mean', 'sentiment_std', 'sentiment_skew', 'avg_confidence',
         'avg_prob_pos', 'avg_prob_ntr', 'avg_prob_neg', 'avg_relevance',
         'avg_source_weight', 'avg_topic_weight', 'avg_novelty',
         'author_count', 'post_count'
     ]
+    grouped = grouped.reset_index() # Reset index early for easier merging
 
-    # --- Calculate Additional Features Requiring Custom Logic ---
+    # Log Post Count
+    grouped['log_post_count'] = np.log1p(grouped['post_count'])
 
-    # 1. Log Post Count (handle count = 0)
-    grouped['log_post_count'] = np.log1p(grouped['post_count']) # log1p handles 0 gracefully (log(1+0)=0)
-
-    # 2. Positive/Negative Ratio (handle division by zero)
+    # Positive/Negative Ratio
     def calculate_pos_neg_ratio(sub_df):
-        pos_count = (sub_df['Sentiment'] == 1).sum()
-        neg_count = (sub_df['Sentiment'] == -1).sum()
-        if neg_count == 0:
-            # If only positive or neutral posts, ratio is effectively infinite or large.
-            # Return pos_count as a representation, or choose a large number like 999.
-            return float(pos_count) if pos_count > 0 else 0.0
-        return float(pos_count) / neg_count
-
+        pos = (sub_df['Sentiment'] == 1).sum()
+        neg = (sub_df['Sentiment'] == -1).sum()
+        return float(pos) / neg if neg > 0 else (float(pos) if pos > 0 else 0.0)
     pos_neg = df_processed.groupby(['Ticker', 'Date']).apply(calculate_pos_neg_ratio).reset_index(name='pos_neg_ratio')
-    grouped = pd.merge(grouped.reset_index(), pos_neg, on=['Ticker', 'Date'], how='left')
+    grouped = pd.merge(grouped, pos_neg, on=['Ticker', 'Date'], how='left')
 
-    # 3. Weighted Sentiment (by Relevance)
+    # Weighted Sentiment (Relevance)
     def calculate_weighted_sentiment(sub_df):
-        # Ensure Relevance is numeric and handle potential NaNs
-        relevance = pd.to_numeric(sub_df['Relevance'], errors='coerce').fillna(0)
-        sentiment = pd.to_numeric(sub_df['Sentiment'], errors='coerce').fillna(0)
-        # Avoid division by zero if count is zero or relevance sum is zero
-        total_relevance = relevance.sum()
-        if total_relevance == 0:
-             return 0.0 # Or return np.nan if preferred
-        return (sentiment * relevance).sum() / total_relevance
-
-
+        rel = pd.to_numeric(sub_df['Relevance'], errors='coerce').fillna(0)
+        sent = pd.to_numeric(sub_df['Sentiment'], errors='coerce').fillna(0)
+        tot_rel = rel.sum()
+        return (sent * rel).sum() / tot_rel if tot_rel > 0 else 0.0
     weighted_sent = df_processed.groupby(['Ticker', 'Date']).apply(calculate_weighted_sentiment).reset_index(name='weighted_sentiment_relevance')
     grouped = pd.merge(grouped, weighted_sent, on=['Ticker', 'Date'], how='left')
 
-    # 4. Probability Uncertainty
+    # Probability Uncertainty
     def calculate_uncertainty(sub_df):
-        # Ensure probability columns are numeric and handle NaNs
         prob_cols = ['Prob_POS', 'Prob_NEG', 'Prob_NTR']
-        for col in prob_cols:
-             sub_df[col] = pd.to_numeric(sub_df[col], errors='coerce').fillna(0)
-
+        for col in prob_cols: sub_df[col] = pd.to_numeric(sub_df[col], errors='coerce').fillna(0)
         probs = sub_df[prob_cols].values
-        if probs.shape[0] == 0: # Handle empty sub-dataframe
-             return 0.0
-        max_prob = np.max(probs, axis=1)
-        # Uncertainty: 1 - max_prob (higher means less confidence in any single class)
-        # Average uncertainty over posts for the day
-        uncertainty = 1.0 - max_prob
-        return uncertainty.mean() if len(uncertainty) > 0 else 0.0
-
+        if probs.shape[0] == 0: return 0.0
+        uncert = 1.0 - np.max(probs, axis=1)
+        return uncert.mean() if len(uncert) > 0 else 0.0
     prob_uncert = df_processed.groupby(['Ticker', 'Date']).apply(calculate_uncertainty).reset_index(name='prob_uncertainty')
     grouped = pd.merge(grouped, prob_uncert, on=['Ticker', 'Date'], how='left')
 
-
-    # 5. Temporal Features (AM/PM difference) - Requires Received_Time_EST
+    # Temporal Features (AM/PM)
     noon_est = time(12, 0)
     df_processed['is_am'] = df_processed['Received_Time_EST'].dt.time < noon_est
-
     def calculate_temporal_diffs(sub_df):
-        # Ensure Sentiment is numeric
         sub_df['Sentiment'] = pd.to_numeric(sub_df['Sentiment'], errors='coerce')
+        sent_am = sub_df.loc[sub_df['is_am'], 'Sentiment'].mean()
+        sent_pm = sub_df.loc[~sub_df['is_am'], 'Sentiment'].mean()
+        vol_am = sub_df['is_am'].sum(); vol_pm = (~sub_df['is_am']).sum()
+        sent_diff = sent_am - sent_pm if pd.notna(sent_am) and pd.notna(sent_pm) else 0.0
+        vol_ratio = float(vol_am) / vol_pm if vol_pm > 0 else (float(vol_am) if vol_am > 0 else 0.0)
+        return pd.Series({'sentiment_am_pm_diff': sent_diff, 'volume_am_pm_ratio': vol_ratio})
+    temporal = df_processed.groupby(['Ticker', 'Date']).apply(calculate_temporal_diffs).reset_index()
+    grouped = pd.merge(grouped, temporal, on=['Ticker', 'Date'], how='left')
 
-        sentiment_am = sub_df.loc[sub_df['is_am'], 'Sentiment'].mean() # NaNs automatically ignored by mean
-        sentiment_pm = sub_df.loc[~sub_df['is_am'], 'Sentiment'].mean() # NaNs automatically ignored by mean
-        volume_am = sub_df['is_am'].sum()
-        volume_pm = (~sub_df['is_am']).sum()
+    # Interaction Feature
+    grouped['sentiment_volume_interaction'] = grouped['sentiment_mean'] * grouped['log_post_count']
 
-        # Handle cases where there's no AM or PM data (mean returns NaN)
-        sentiment_diff = sentiment_am - sentiment_pm if pd.notna(sentiment_am) and pd.notna(sentiment_pm) else 0.0
+    # *** NEW: Probability Difference Feature ***
+    grouped['prob_diff'] = grouped['avg_prob_pos'] - grouped['avg_prob_neg']
 
-        if volume_pm == 0:
-             # If only AM volume, ratio is large. Return AM volume or a large number.
-             volume_ratio = float(volume_am) if volume_am > 0 else 0.0
-        else:
-             volume_ratio = float(volume_am) / volume_pm
-
-        return pd.Series({
-            'sentiment_am_pm_diff': sentiment_diff,
-            'volume_am_pm_ratio': volume_ratio
-        })
-
-    temporal_features = df_processed.groupby(['Ticker', 'Date']).apply(calculate_temporal_diffs).reset_index()
-    grouped = pd.merge(grouped, temporal_features, on=['Ticker', 'Date'], how='left')
-
-
-    # --- Final Cleanup ---
-    # Reset index if it hasn't been already
-    if isinstance(grouped.index, pd.MultiIndex):
-         grouped = grouped.reset_index()
-
-
-    # Fill any remaining NaNs (e.g., std/skew for single posts, ratios with zero denominators) with 0
-    # Important: Do this *after* all merges and calculations
+    # Final Cleanup
     grouped = grouped.fillna(0)
+    grouped.replace([np.inf, -np.inf], 0, inplace=True)
 
-    # Handle potential infinite values resulted from division by zero (e.g., in ratios)
-    grouped.replace([np.inf, -np.inf], 0, inplace=True) # Replace inf with 0, consider if a large number is better
-
-    # Ensure correct column order (optional but good practice)
+    # Define final feature set
     feature_order = [
         'sentiment_mean', 'sentiment_std', 'sentiment_skew', 'pos_neg_ratio',
         'log_post_count', 'author_count', 'sentiment_am_pm_diff', 'volume_am_pm_ratio',
-        'avg_confidence', 'avg_prob_pos', 'avg_prob_ntr', 'avg_prob_neg',
+        'avg_confidence', 'avg_prob_pos', 'avg_prob_ntr', 'avg_prob_neg', 'prob_diff', # Added prob_diff
         'prob_uncertainty', 'avg_source_weight', 'avg_topic_weight',
-        'weighted_sentiment_relevance', 'avg_relevance', 'avg_novelty', 'post_count' # Keep post_count if needed elsewhere
+        'weighted_sentiment_relevance', 'avg_relevance', 'avg_novelty',
+        'sentiment_volume_interaction'
     ]
-    # Add any missing columns from the expected order (e.g., if a feature calculation failed)
     final_cols = ['Ticker', 'Date']
     for col in feature_order:
-        if col not in grouped.columns:
-            grouped[col] = 0.0
-        if col != 'post_count': # Exclude post_count from final feature set for model if log_post_count is used
-             final_cols.append(col)
-
-
-    return grouped[final_cols] # Return with Ticker, Date as columns and selected features
+        if col not in grouped.columns: grouped[col] = 0.0
+        final_cols.append(col)
+    return grouped[final_cols]
 
 
 ####################################
@@ -353,47 +212,63 @@ def create_features(df_processed):
 
 class FeedforwardNet(nn.Module):
     """
-    A simple feedforward neural network with two hidden layers and ReLU activations.
+    Feedforward neural network with Batch Normalization layers.
     """
-    def __init__(self, input_dim, hidden_dim1=64, hidden_dim2=32):
+    # *** MODIFIED: Simpler architecture (64, 32) + Batch Norm ***
+    def __init__(self, input_dim, hidden_dim1=64, hidden_dim2=32, dropout_rate=0.25):
         """
-        Initializes the network layers.
+        Initializes the network layers including BatchNorm.
 
         Parameters:
         -----------
         input_dim : int
             Number of input features.
-        hidden_dim1 : int, optional
-            Number of neurons in the first hidden layer (default is 64).
-        hidden_dim2 : int, optional
-            Number of neurons in the second hidden layer (default is 32).
+        hidden_dim1 : int, optional (default is 64).
+        hidden_dim2 : int, optional (default is 32).
+        dropout_rate : float, optional (default is 0.25).
         """
         super(FeedforwardNet, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim1),
-            nn.ReLU(),
-            nn.Dropout(0.2), # Add dropout for regularization
-            nn.Linear(hidden_dim1, hidden_dim2),
-            nn.ReLU(),
-            nn.Dropout(0.2), # Add dropout for regularization
-            nn.Linear(hidden_dim2, 1)  # Output layer predicts a single value (return)
-        )
+        self.layer1 = nn.Linear(input_dim, hidden_dim1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim1) # Batch Norm after first linear layer
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout_rate)
+
+        self.layer2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.bn2 = nn.BatchNorm1d(hidden_dim2) # Batch Norm after second linear layer
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+        self.output_layer = nn.Linear(hidden_dim2, 1)
 
     def forward(self, x):
         """
-        Defines the forward pass of the network.
-
-        Parameters:
-        -----------
-        x : torch.Tensor
-            Input tensor containing features.
-
-        Returns:
-        --------
-        torch.Tensor
-            Output tensor representing the predicted return.
+        Defines the forward pass with BatchNorm.
         """
-        return self.net(x)
+        x = self.layer1(x)
+        # Apply BatchNorm only if batch size > 1 during training
+        if self.training and x.size(0) > 1:
+             x = self.bn1(x)
+        elif not self.training and x.size(0) > 0: # Apply running stats during eval if possible
+             # Check if bn1 has running_mean to avoid errors on first eval pass if batch size was 1
+             if hasattr(self.bn1, 'running_mean') and self.bn1.running_mean is not None:
+                  x = self.bn1(x)
+             # else: pass through without BN if running stats aren't available yet
+
+        x = self.relu1(x)
+        x = self.dropout1(x)
+
+        x = self.layer2(x)
+        if self.training and x.size(0) > 1:
+             x = self.bn2(x)
+        elif not self.training and x.size(0) > 0:
+             if hasattr(self.bn2, 'running_mean') and self.bn2.running_mean is not None:
+                  x = self.bn2(x)
+
+        x = self.relu2(x)
+        x = self.dropout2(x)
+
+        x = self.output_layer(x)
+        return x
 
 ####################################
 # Main Functions: train_model
@@ -402,199 +277,157 @@ class FeedforwardNet(nn.Module):
 def train_model(sentiment_data, return_data):
     """
     Trains a PyTorch neural network model using sentiment features to predict next-day stock returns.
-
-    Steps:
-    1. Preprocesses sentiment and return data.
-    2. Creates features from sentiment data.
-    3. Merges features with next-day returns.
-    4. Splits data into training and validation sets based on time.
-    5. Scales features using StandardScaler.
-    6. Defines and trains the PyTorch FeedforwardNet model.
-    7. Saves the trained model, scaler, and feature list.
-
-    Parameters:
-    -----------
-    sentiment_data : pd.DataFrame
-        The Reddit sentiment data for training (e.g., sentiment_train_2017_2021.csv).
-        Requires columns like 'Received_Time', 'Ticker', 'Sentiment', etc.
-    return_data : pd.DataFrame
-        The stock return data for training (e.g., return_train_2017_2021.csv).
-        Requires columns 'Date', 'Ticker', 'Return'.
-
-    Returns:
-    --------
-    dict
-        A dictionary `model_info` containing:
-        - 'model': The trained PyTorch model (FeedforwardNet instance).
-        - 'scaler': The fitted StandardScaler object.
-        - 'feature_columns': A list of feature names used for training.
-        - 'device': The torch device used for training ('cuda' or 'cpu').
+    Includes target variable clipping and uses BatchNorm in the model.
     """
-    print("--- Starting Model Training ---")
+    print("--- Starting Model Training (Improved v2 - BatchNorm & Clipping) ---")
 
     # --- 1. Preprocessing ---
     print("Preprocessing sentiment data...")
-    try:
-        sentiment_processed = preprocess_sentiment_data(sentiment_data)
-        if sentiment_processed.empty:
-             raise ValueError("Preprocessing resulted in empty sentiment DataFrame.")
-    except Exception as e:
-        print(f"Error during sentiment preprocessing: {e}")
-        raise # Re-raise the exception to stop execution
-
+    try: sentiment_processed = preprocess_sentiment_data(sentiment_data)
+    except Exception as e: print(f"Error: {e}"); raise
     print("Preprocessing return data...")
     try:
         return_data_processed = return_data.copy()
-        # Ensure Date is datetime and normalized to midnight
         return_data_processed['Date'] = pd.to_datetime(return_data_processed['Date'], errors='coerce').dt.normalize()
-        # Ensure Ticker is uppercase string
         return_data_processed['Ticker'] = return_data_processed['Ticker'].astype(str).str.upper().str.strip()
-        # Convert Return column, handling potential errors
         return_data_processed['Return'] = return_data_processed['Return'].apply(convert_return)
-        # Drop rows where Date or Return conversion failed
         return_data_processed = return_data_processed.dropna(subset=['Date', 'Ticker', 'Return'])
-        if return_data_processed.empty:
-            raise ValueError("Preprocessing resulted in empty return DataFrame.")
-    except Exception as e:
-        print(f"Error during return data preprocessing: {e}")
-        raise
+        if return_data_processed.empty: raise ValueError("Empty return DataFrame after preprocessing.")
+    except Exception as e: print(f"Error: {e}"); raise
 
     # --- 2. Feature Engineering ---
-    print("Creating features from sentiment data...")
-    try:
-        features_df = create_features(sentiment_processed)
-        if features_df.empty:
-             raise ValueError("Feature creation resulted in an empty DataFrame.")
-    except Exception as e:
-        print(f"Error during feature creation: {e}")
-        raise
-
-    # Define the exact list of features used for model input
-    # Exclude 'Ticker', 'Date', and raw 'post_count'
+    print("Creating features...")
+    try: features_df = create_features(sentiment_processed)
+    except Exception as e: print(f"Error: {e}"); raise
     feature_columns = [col for col in features_df.columns if col not in ['Ticker', 'Date', 'post_count']]
-    print(f"Using features: {feature_columns}")
-
+    print(f"Using {len(feature_columns)} features: {feature_columns}")
 
     # --- 3. Merging Data ---
-    print("Merging sentiment features with stock returns...")
-    # Merge features (for day D) with returns (for day D+1, which corresponds to the 'Date' in return_data)
+    print("Merging data...")
     model_data = pd.merge(features_df, return_data_processed[['Date', 'Ticker', 'Return']],
                           on=['Date', 'Ticker'], how='inner')
-
-    # Drop rows with NaN returns that might have slipped through
     model_data = model_data.dropna(subset=['Return'])
-    # Fill NaNs in feature columns with 0 (safer than dropping rows)
     model_data[feature_columns] = model_data[feature_columns].fillna(0)
-    # Handle potential infinities just in case
     model_data.replace([np.inf, -np.inf], 0, inplace=True)
-
-
-    if model_data.empty:
-        raise ValueError("Merging features and returns resulted in an empty DataFrame. Check date alignment and ticker matching.")
-
+    if model_data.empty: raise ValueError("Empty DataFrame after merging.")
     print(f"Merged data shape: {model_data.shape}")
 
-    # --- 4. Train/Validation Split (Time-Based) ---
-    print("Splitting data into training and validation sets...")
+    # --- 4. Train/Validation Split ---
+    print("Splitting data...")
     model_data = model_data.sort_values('Date')
     unique_dates = np.sort(model_data['Date'].unique())
-
-    if len(unique_dates) < 5: # Need enough dates for a meaningful split
-        raise ValueError("Not enough unique dates in the data for a train/validation split.")
-
-    # Use an 80/20 split based on unique dates
+    if len(unique_dates) < 5: raise ValueError("Not enough unique dates for split.")
     split_index = int(0.8 * len(unique_dates))
     train_cutoff_date = unique_dates[split_index]
-
     train_data = model_data[model_data['Date'] < train_cutoff_date]
     val_data = model_data[model_data['Date'] >= train_cutoff_date]
-
-    if train_data.empty or val_data.empty:
-        raise ValueError("Train or validation set is empty after time-based split. Check date range.")
-
-    print(f"Training data shape: {train_data.shape}, Dates: {train_data['Date'].min()} to {train_data['Date'].max()}")
-    print(f"Validation data shape: {val_data.shape}, Dates: {val_data['Date'].min()} to {val_data['Date'].max()}")
+    if train_data.empty or val_data.empty: raise ValueError("Empty train or validation set.")
+    print(f"Train shape: {train_data.shape}, Val shape: {val_data.shape}")
 
     X_train = train_data[feature_columns].values
     y_train = train_data['Return'].values.reshape(-1, 1)
     X_val = val_data[feature_columns].values
     y_val = val_data['Return'].values.reshape(-1, 1)
 
+    # --- *** NEW: Clip Target Variable (Returns) *** ---
+    return_clip_threshold = 0.10 # Clip returns at +/- 10%
+    y_train_clipped = np.clip(y_train, -return_clip_threshold, return_clip_threshold)
+    y_val_clipped = np.clip(y_val, -return_clip_threshold, return_clip_threshold)
+    print(f"Clipping target returns to [{-return_clip_threshold:.2f}, {return_clip_threshold:.2f}] for training.")
 
     # --- 5. Feature Scaling ---
     print("Scaling features...")
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train) # Fit only on training data
-    X_val_scaled = scaler.transform(X_val)         # Transform validation data
-
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
 
     # --- 6. PyTorch Model Training ---
     print("Converting data to PyTorch tensors...")
     X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32).to(device)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).to(device)
+    # Use clipped target variables for training
+    y_train_tensor = torch.tensor(y_train_clipped, dtype=torch.float32).to(device)
     X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).to(device)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).to(device)
+    y_val_tensor = torch.tensor(y_val_clipped, dtype=torch.float32).to(device)
 
     input_dim = X_train_tensor.shape[1]
-    model_net = FeedforwardNet(input_dim).to(device)
+    # *** MODIFIED: Instantiate the updated network with BatchNorm ***
+    model_net = FeedforwardNet(input_dim, hidden_dim1=64, hidden_dim2=32, dropout_rate=0.25).to(device)
 
-    # Define Loss and Optimizer
-    criterion = nn.MSELoss() # Mean Squared Error for regression
-    optimizer = optim.Adam(model_net.parameters(), lr=0.001, weight_decay=1e-5) # Adam optimizer with L2 regularization
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model_net.parameters(), lr=0.0005, weight_decay=1e-5)
+    # *** MODIFIED: Adjusted scheduler gamma ***
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.75) # Slower decay
 
-    # Training Loop Parameters
-    epochs = 100 # Reduced epochs for faster example, increase for better convergence
-    batch_size = 256 # Process data in batches
-    patience = 10 # Early stopping patience
+    epochs = 150
+    batch_size = 256
+    patience = 20 # Increased patience slightly for BatchNorm stabilization
     best_val_loss = float('inf')
     epochs_no_improve = 0
 
-
     print("Starting PyTorch model training...")
     for epoch in range(epochs):
-        model_net.train() # Set model to training mode
+        model_net.train() # Set model to training mode (enables BatchNorm updates, dropout)
         permutation = torch.randperm(X_train_tensor.size(0))
-
         train_loss_epoch = 0.0
         for i in range(0, X_train_tensor.size(0), batch_size):
             indices = permutation[i:i+batch_size]
             batch_x, batch_y = X_train_tensor[indices], y_train_tensor[indices]
 
-            optimizer.zero_grad()       # Clear gradients
-            outputs = model_net(batch_x) # Forward pass
-            loss = criterion(outputs, batch_y) # Calculate loss
-            loss.backward()             # Backward pass
-            optimizer.step()            # Update weights
+            # Skip batch if size is 1 and BatchNorm is used, as BN requires >1 sample
+            if batch_x.size(0) <= 1 and isinstance(model_net, FeedforwardNet):
+                 continue
 
-            train_loss_epoch += loss.item() * batch_x.size(0)
+            optimizer.zero_grad()
+            outputs = model_net(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss_epoch += loss.item() * batch_x.size(0) # Use actual batch size
 
-        train_loss_epoch /= X_train_tensor.size(0)
+        # Recalculate total size used in epoch if batches were skipped
+        total_train_samples = (permutation.size(0) // batch_size) * batch_size + (permutation.size(0) % batch_size if permutation.size(0) % batch_size > 1 else 0)
+        if total_train_samples > 0:
+             train_loss_epoch /= total_train_samples
+        else:
+             train_loss_epoch = 0 # Handle case where all batches were skipped
+
 
         # Validation Phase
-        model_net.eval() # Set model to evaluation mode
+        model_net.eval() # Set model to evaluation mode (uses running stats for BN, disables dropout)
         val_loss_epoch = 0.0
-        with torch.no_grad(): # Disable gradient calculation for validation
-             permutation_val = torch.randperm(X_val_tensor.size(0))
+        with torch.no_grad():
+             # No need to shuffle validation data usually
              for i in range(0, X_val_tensor.size(0), batch_size):
-                  indices_val = permutation_val[i:i+batch_size]
-                  batch_x_val, batch_y_val = X_val_tensor[indices_val], y_val_tensor[indices_val]
+                  batch_x_val, batch_y_val = X_val_tensor[i:i+batch_size], y_val_tensor[i:i+batch_size]
 
-                  val_outputs = model_net(batch_x_val)
-                  val_loss = criterion(val_outputs, batch_y_val)
-                  val_loss_epoch += val_loss.item() * batch_x_val.size(0)
+                  # Handle potential last batch size of 1 during evaluation if BN is used
+                  if batch_x_val.size(0) <= 1 and isinstance(model_net, FeedforwardNet):
+                      # Optionally skip or handle differently (e.g., predict but don't update loss average)
+                      # For simplicity, we might skip calculating loss for this batch,
+                      # or ensure BN handles eval mode correctly (which it should with running stats)
+                      pass # BatchNorm should use running stats in eval mode
 
-        val_loss_epoch /= X_val_tensor.size(0)
+                  if batch_x_val.size(0) > 0: # Ensure batch is not empty
+                     val_outputs = model_net(batch_x_val)
+                     val_loss = criterion(val_outputs, batch_y_val)
+                     val_loss_epoch += val_loss.item() * batch_x_val.size(0)
 
+        if X_val_tensor.size(0) > 0:
+             val_loss_epoch /= X_val_tensor.size(0)
+        else:
+             val_loss_epoch = 0
 
-        if (epoch + 1) % 10 == 0 or epoch == 0: # Print every 10 epochs and the first epoch
-             print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {train_loss_epoch:.6f} | Val Loss: {val_loss_epoch:.6f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+             print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {train_loss_epoch:.6f} | Val Loss: {val_loss_epoch:.6f} | LR: {current_lr:.6f}")
 
         # Early Stopping Check
         if val_loss_epoch < best_val_loss:
             best_val_loss = val_loss_epoch
             epochs_no_improve = 0
-            # Optionally save the best model state here
-            # torch.save(model_net.state_dict(), 'best_model.pth')
+            # torch.save(model_net.state_dict(), 'best_model_bn_clip.pth')
         else:
             epochs_no_improve += 1
 
@@ -603,12 +436,9 @@ def train_model(sentiment_data, return_data):
             break
 
     # --- 7. Prepare Model Info ---
-    # This dictionary is the object passed as 'model' to predict_returns
     model_info = {
-        'model': model_net,
-        'scaler': scaler,
-        'feature_columns': feature_columns,
-        'device': device
+        'model': model_net, 'scaler': scaler,
+        'feature_columns': feature_columns, 'device': device
     }
     print("--- Training complete. Model Info created. ---")
     return model_info
@@ -620,182 +450,134 @@ def train_model(sentiment_data, return_data):
 
 def predict_returns(model, sentiment_data_today, stock_universe_today):
     """
-    Generates predictions of next-day returns for a given list of stocks using a trained model.
-
-    Steps:
-    1. Preprocesses the sentiment data for the current day.
-    2. Creates features for the current day's sentiment data.
-    3. Creates a DataFrame encompassing all stocks in today's universe.
-    4. Merges calculated features, filling missing values for stocks with no sentiment data.
-    5. Ensures all required feature columns are present and ordered correctly.
-    6. Scales the features using the scaler from the `model` dictionary.
-    7. Uses the trained model object from the `model` dictionary to predict returns.
-    8. Calculates the percentile rank ('Signal_Rank') for each prediction.
-    9. Formats and returns the predictions.
-
-    Parameters:
-    -----------
-    model : dict
-        Dictionary returned by `train_model`, containing the trained model object ('model'),
-        the fitted scaler ('scaler'), feature column list ('feature_columns'), and device ('device').
-    sentiment_data_today : pd.DataFrame or None
-        Raw sentiment data for the *current* day (posts received up to 4 PM EST).
-        Can be None or an empty DataFrame if no sentiment data is available.
-    stock_universe_today : list
-        List of stock tickers (strings) available for trading *tomorrow*.
-        Predictions should be generated for all tickers in this list.
-
-    Returns:
-    --------
-    pd.DataFrame
-        A DataFrame with columns ['Ticker', 'Predicted_Return', 'Signal_Rank'].
-        Contains one row for each ticker in `stock_universe_today`.
-        'Signal_Rank' is the percentile rank (0-1) of 'Predicted_Return'.
+    Generates predictions of next-day returns using the trained model (v2).
     """
     print("--- Starting Prediction ---")
-
-    # --- Input Validation ---
-    # Check if the 'model' dictionary has the required keys
     if not isinstance(model, dict) or not all(k in model for k in ['model', 'scaler', 'feature_columns', 'device']):
-        raise ValueError("Invalid 'model' dictionary provided. Must contain 'model', 'scaler', 'feature_columns', 'device'.")
+        raise ValueError("Invalid 'model' dictionary provided.")
     if not isinstance(sentiment_data_today, pd.DataFrame):
-        # Allow empty DataFrame or None as valid input, handle downstream
-        if not sentiment_data_today is None:
-             raise TypeError("'sentiment_data_today' must be a pandas DataFrame or None.")
-    if not isinstance(stock_universe_today, list):
-        raise TypeError("'stock_universe_today' must be a list of tickers.")
+        if not sentiment_data_today is None: raise TypeError("'sentiment_data_today' must be DataFrame or None.")
+    if not isinstance(stock_universe_today, list): raise TypeError("'stock_universe_today' must be a list.")
     if not stock_universe_today:
-        print("Warning: 'stock_universe_today' is empty. Returning empty predictions.")
+        print("Warning: Empty stock universe. Returning empty predictions.")
         return pd.DataFrame(columns=['Ticker', 'Predicted_Return', 'Signal_Rank'])
 
-
-    # --- 1. Preprocess Today's Sentiment Data ---
     print("Preprocessing today's sentiment data...")
     if sentiment_data_today is None or sentiment_data_today.empty:
-        print("No sentiment data provided for today.")
-        sentiment_today_processed = pd.DataFrame() # Create empty df with expected structure later
+        print("No sentiment data provided.")
+        sentiment_today_processed = pd.DataFrame()
     else:
-        try:
-            # Important: The date assigned by preprocess_sentiment_data aligns
-            # with the *target return date*.
-            sentiment_today_processed = preprocess_sentiment_data(sentiment_data_today)
-            if not sentiment_today_processed.empty:
-                 current_prediction_target_date = sentiment_today_processed['Date'].max()
-                 print(f"Sentiment data processed for target prediction date: {current_prediction_target_date}")
-            else:
-                 print("Preprocessing resulted in empty sentiment DataFrame for today.")
+        try: sentiment_today_processed = preprocess_sentiment_data(sentiment_data_today)
+        except Exception as e: print(f"Error preprocessing: {e}"); sentiment_today_processed = pd.DataFrame()
 
-        except Exception as e:
-            print(f"Error preprocessing today's sentiment data: {e}. Proceeding with default features.")
-            sentiment_today_processed = pd.DataFrame() # Ensure it's an empty DF
-
-
-    # --- 2. Create Features for Today ---
     print("Creating features for today...")
     if sentiment_today_processed.empty:
-        features_today = pd.DataFrame() # Will be handled in step 3
+        features_today = pd.DataFrame()
     else:
         try:
-            # Filter for the relevant date if multiple dates ended up in the input
             if 'Date' in sentiment_today_processed.columns:
                  target_date = sentiment_today_processed['Date'].max()
                  sentiment_today_processed = sentiment_today_processed[sentiment_today_processed['Date'] == target_date]
+            features_today = create_features(sentiment_today_processed) # Includes prob_diff
+        except Exception as e: print(f"Error creating features: {e}"); features_today = pd.DataFrame()
 
-            features_today = create_features(sentiment_today_processed)
-            if features_today.empty and not sentiment_today_processed.empty :
-                 print("Warning: Feature creation resulted in an empty DataFrame despite non-empty input.")
-            elif not features_today.empty:
-                 print(f"Features created for {features_today.shape[0]} tickers.")
-
-        except Exception as e:
-            print(f"Error creating features for today: {e}. Proceeding with default features.")
-            features_today = pd.DataFrame()
-
-
-    # --- 3. Align with Stock Universe ---
-    print(f"Aligning features with today's stock universe ({len(stock_universe_today)} tickers)...")
-    # Create a DataFrame for the full universe
+    print(f"Aligning features with universe ({len(stock_universe_today)} tickers)...")
     universe_df = pd.DataFrame({'Ticker': [t.upper().strip() for t in stock_universe_today]})
-
-    # Retrieve necessary components from the 'model' dictionary
     feature_columns = model['feature_columns']
-    scaler = model['scaler']
-    model_device = model['device']
-    model_obj = model['model'] # The actual PyTorch model object
+    scaler = model['scaler']; model_device = model['device']; model_obj = model['model']
 
-
-    # Merge features_today with the universe_df
     if not features_today.empty and 'Ticker' in features_today.columns:
-        # Ensure Ticker case matches
         features_today['Ticker'] = features_today['Ticker'].astype(str).str.upper().str.strip()
-        # Merge, keeping all tickers from the universe
         final_features_df = pd.merge(universe_df, features_today, on='Ticker', how='left')
     else:
-        # If no features were calculated, start with the universe and add empty feature columns
         final_features_df = universe_df.copy()
-        for col in feature_columns:
-            final_features_df[col] = 0.0 # Initialize with default value
+        for col in feature_columns: final_features_df[col] = 0.0
 
-
-    # --- 4. Fill Missing Features & Ensure Column Order ---
-    # Fill NaNs for tickers that had no sentiment data (or where feature calculation failed)
-    # Use 0 as the default fill value for all features
-    final_features_df[feature_columns] = final_features_df[feature_columns].fillna(0)
-
-    # Ensure all required feature columns exist and are in the correct order
+    # Ensure all feature columns exist, including the new 'prob_diff'
     for col in feature_columns:
         if col not in final_features_df.columns:
-            print(f"Warning: Feature column '{col}' was missing. Adding with default value 0.")
+            print(f"Warning: Feature column '{col}' missing. Adding default 0.")
             final_features_df[col] = 0.0
-    # Reorder columns to match training order
-    final_features_df = final_features_df[['Ticker'] + feature_columns]
+    final_features_df[feature_columns] = final_features_df[feature_columns].fillna(0) # Fill NaNs for missing tickers/features
+    final_features_df = final_features_df[['Ticker'] + feature_columns] # Ensure order
 
-
-    # --- 5. Scale Features ---
-    print("Scaling features for prediction...")
+    print("Scaling features...")
     X_today = final_features_df[feature_columns].values
-    try:
-        X_today_scaled = scaler.transform(X_today) # Use the *fitted* scaler from the 'model' dictionary
-    except Exception as e:
-        print(f"Error scaling features: {e}. Check scaler compatibility.")
-        # Fallback: predict using unscaled features (likely poor results)
-        # Or handle more gracefully (e.g., return default predictions)
-        raise # Re-raise for now
+    try: X_today_scaled = scaler.transform(X_today)
+    except Exception as e: print(f"Error scaling: {e}"); raise
 
-
-    # --- 6. Predict Returns ---
-    print("Making predictions with the PyTorch model...")
+    print("Making predictions...")
     X_today_tensor = torch.tensor(X_today_scaled, dtype=torch.float32).to(model_device)
-
-    model_obj.eval() # Set model to evaluation mode using the object from the 'model' dictionary
-    predictions_array = np.zeros(len(final_features_df)) # Default prediction is 0
-
+    model_obj.eval() # Set to evaluation mode
+    predictions_array = np.zeros(len(final_features_df))
     try:
         with torch.no_grad():
+            # Handle potential batch size of 1 during prediction if BN is used
+            # In eval mode, BN should use running stats, so it's generally safe.
+            # But loop just in case large prediction sets cause memory issues (unlikely here)
             predictions_tensor = model_obj(X_today_tensor)
-        predictions_array = predictions_tensor.cpu().numpy().flatten() # Move to CPU and flatten
-        print(f"Predictions generated for {len(predictions_array)} tickers.")
-    except Exception as e:
-        print(f"Error during model prediction: {e}. Returning default predictions (0).")
-        # predictions_array remains zeros
+        predictions_array = predictions_tensor.cpu().numpy().flatten()
+    except Exception as e: print(f"Error during prediction: {e}")
 
-
-    # Add a tiny amount of noise to break ties for ranking - crucial for stable ranks
     noise = np.random.normal(0, 1e-7, size=predictions_array.shape)
     final_features_df['Predicted_Return'] = predictions_array + noise
 
-
-    # --- 7. Calculate Signal Rank ---
     print("Calculating signal ranks...")
-    # rank(pct=True) gives percentile rank from 0 to 1
     final_features_df['Signal_Rank'] = final_features_df['Predicted_Return'].rank(pct=True)
 
-
-    # --- 8. Format Output ---
     predictions_output = final_features_df[['Ticker', 'Predicted_Return', 'Signal_Rank']].copy()
-    # Ensure no NaNs in final output (shouldn't happen with fillna, but double-check)
     predictions_output.fillna({'Predicted_Return': 0.0, 'Signal_Rank': 0.0}, inplace=True)
-
 
     print(f"--- Prediction complete. Returning {predictions_output.shape[0]} predictions. ---")
     return predictions_output
+
+
+####################################
+# Test Section (Optional)
+####################################
+if __name__ == "__main__":
+    print("--- Running Test Section (Improved Model v2) ---")
+    sentiment_file = './data/sentiment_train_2017_2021.csv'
+    return_file = './data/return_train_2017_2021.csv'
+    try:
+        sentiment_data_train = pd.read_csv(sentiment_file)
+        return_data_train = pd.read_csv(return_file)
+        print("Data loaded.")
+        print("\n--- Testing train_model ---")
+        model_info_dict = train_model(sentiment_data_train, return_data_train)
+        print("train_model executed.")
+        print(f"Device: {model_info_dict['device']}, Features: {len(model_info_dict['feature_columns'])}")
+
+        print("\n--- Testing predict_returns ---")
+        sample_date_str = '2021-10-01'
+        sample_target_date = pd.to_datetime(sample_date_str).normalize()
+        test_received_date = (sample_target_date - pd.Timedelta(days=1)).date()
+
+        sentiment_data_train['Received_Time'] = pd.to_datetime(sentiment_data_train['Received_Time'], errors='coerce', utc=True)
+        sentiment_data_train.dropna(subset=['Received_Time'], inplace=True)
+        sentiment_data_train['Received_Time_EST'] = sentiment_data_train['Received_Time'].dt.tz_convert('America/New_York')
+        sentiment_data_train['local_date'] = sentiment_data_train['Received_Time_EST'].dt.date
+        sentiment_data_today_raw_test = sentiment_data_train[sentiment_data_train['local_date'] == test_received_date].copy()
+
+        return_data_train['Date'] = pd.to_datetime(return_data_train['Date'], errors='coerce').dt.normalize()
+        stock_universe_today_test = return_data_train[return_data_train['Date'] == sample_target_date]['Ticker'].unique().tolist()
+
+        if not stock_universe_today_test: print(f"Warning: No stocks for {sample_target_date}.")
+        elif sentiment_data_today_raw_test.empty: print(f"Warning: No sentiment for {test_received_date}.")
+        else: print(f"Using {sentiment_data_today_raw_test.shape[0]} records from {test_received_date} for {len(stock_universe_today_test)} stocks.")
+
+        predictions = predict_returns(model=model_info_dict,
+                                      sentiment_data_today=sentiment_data_today_raw_test if not sentiment_data_today_raw_test.empty else pd.DataFrame(),
+                                      stock_universe_today=stock_universe_today_test)
+
+        print("\nSample predictions:")
+        print(predictions.head())
+        print(f"\nPredictions shape: {predictions.shape}")
+        if not stock_universe_today_test or predictions.empty: print("Skipping universe check.")
+        elif set(predictions['Ticker'].unique()) == set([t.upper().strip() for t in stock_universe_today_test]): print("All universe tickers present.")
+        else: print("Warning: Mismatch between predicted tickers and universe.")
+
+    except FileNotFoundError: print(f"Error: Data files not found.")
+    except Exception as e: print(f"Error in test section: {e}"); import traceback; traceback.print_exc()
+    print("--- Test Section Finished ---")
+
